@@ -4,6 +4,7 @@ const { BlobServiceClient } = require("@azure/storage-blob");
 
 module.exports = async function (context, req) {
     const containerName = req.query.container;
+    const fileName = req.query.filename;
     const accountName = "webstoragefiles";
 
     const credential = new DefaultAzureCredential({
@@ -16,18 +17,13 @@ module.exports = async function (context, req) {
     );
 
     const containerClient = blobServiceClient.getContainerClient(containerName);
-    const blobs = [];
+    const blockBlobClient = containerClient.getBlockBlobClient(fileName);
 
-    for await (const blob of containerClient.listBlobsFlat()) {
-        blobs.push({
-            name: blob.name,
-            lastModified: blob.properties.lastModified,
-            contentLength: blob.properties.contentLength
-        });
-    }
+    const content = req.body;
+    const uploadBlobResponse = await blockBlobClient.upload(content, Buffer.byteLength(content));
 
     context.res = {
         status: 200,
-        body: blobs
+        body: { message: "File uploaded successfully", requestId: uploadBlobResponse.requestId }
     };
 };
