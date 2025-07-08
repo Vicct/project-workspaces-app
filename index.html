@@ -1,0 +1,305 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+  <meta charset="UTF-8" />
+  <title>SAT Blob Web Share</title>
+  <script src="https://alcdn.msauth.net/browser/2.37.0/js/msal-browser.min.js"></script>
+  <style>
+    body { font-family: Arial, sans-serif; padding: 2rem; background-color: #f8f8f8; }
+    h1 { color: #0078D4; }
+    ul { list-style: none; padding-left: 0; }
+    li { margin-bottom: 0.5rem; }
+    input[type="file"], input[type="text"] { margin-top: 0.5rem; }
+    button { margin: 0.5rem 0.2rem; padding: 0.5rem 1rem; }
+    .folder { font-weight: bold; cursor: pointer; }
+    .file-meta { font-size: 0.8em; color: #666; margin-left: 0.5rem; }
+    .back-button { font-weight: bold; color: #0078D4; cursor: pointer; margin-bottom: 1rem; display: inline-block; }
+  </style>
+</head>
+<body>
+  <h1>SAT Blob Web Share</h1>
+  <p id="status">Autenticando...</p>
+
+  <div>
+    <label>Seleccionar archivo(s):</label>
+    <input type="file" id="fileInput" multiple />
+    <button onclick="uploadFiles()">Subir</button>
+    <button onclick="deleteSelectedFiles(currentToken)">Eliminar</button>
+  </div>
+
+  <div>
+    <label>Nueva carpeta:</label>
+    <input type="text" id="newFolderInput" />
+    <button onclick="createFolder()">Crear carpeta</button>
+  </div>
+
+  <p><strong>Ruta actual:</strong> <span id="selectedFolder">(ninguna)</span></p>
+  <div class="back-button" onclick="goBackFolder()">⬅ Volver</div>
+
+  <h2>Contenido:</h2>
+  <ul id="contentList"></ul>
+
+  <script>
+    const config = {
+      clientId: "8ac2cfb8-30bb-40cc-83bc-6d1c71c0759a",
+      tenantId: "66ea51c7-f3f0-4dcf-8fb8-d8ea1123b9aa",
+      storageAccount: "webstoragefiles",
+      containerName: "$web"
+    };
+
+    const msalInstance = new msal.PublicClientApplication({
+      auth: {
+        clientId: config.clientId,
+        authority: `https://login.microsoftonline.com/${config.tenantId}`,
+        redirectUri: window.location.href
+      }
+    });
+
+    let currentToken = null;
+    let currentFolder = "";
+    let currentUser = "";
+
+    async function login() {
+      const result = await msalInstance.loginPopup({
+        scopes: ["https://storage.azure.com/user_impersonation"]
+      });
+      currentToken = result.accessToken;
+      currentUser = result.account.username;
+      document.getElementById("status").textContent = `Autenticado como ${currentUser}`;
+    }
+
+    function goBackFolder() {
+      if (!currentFolder.includes("/")) {
+        listFiles("root/");
+        return;
+      }
+      const parent = currentFolder.endsWith("/") ? currentFolder.slice(0, -1) : currentFolder;
+      const parentFolder = parent.substring(0, parent.lastIndexOf("/") + 1);
+      listFiles(parentFolder);
+    }
+
+    async function listFiles(prefix = "root/") {
+      currentFolder = prefix;
+      document.getElementById("selectedFolder").textContent = prefix || "(raíz)";
+      const listEl = document.getElementById("contentList");
+      listEl.innerHTML = "";
+
+      const url = `https://${config.storageAccount}.blob.core.windows.net/${config.containerName}?restype=container&comp=list&prefix=${encodeURIComponent(prefix)}&delimiter=/`;
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${currentToken}`,
+          "x-ms-version": "2023-01-03"
+        }
+      });
+
+      const xml = await res.text();
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(xml, "application/xml");
+
+      const prefixes = doc.getElementsByTagName("BlobPrefix");
+      for (let prefixEl of prefixes) {
+        const name = prefixEl.getElementsByTagName("Name")[0].textContent;
+        const li = document.createElement("li");
+        li.textContent = name.replace(currentFolder, "");
+        li.className = "folder";
+        li.onclick = () => listFiles(name);
+        listEl.appendChild(li);
+      }
+
+      const blobs = doc.getElementsByTagName("Blob");
+      for (let blob of blobs) {
+        const name = blob.getElementsByTagName("Name")[0].textContent;
+        const lastModified = blob.getElementsByTagName("Last-Modified")[0].textContent;
+        if (name.endsWith(".dummy") || name === "activity.log" || name === "index.html") continue;
+
+        const li = document.createElement("li");
+        const chk = document.createElement("input");
+        chk.type = "checkbox";
+        chk.value = name;
+
+        const a = document.createElement("a");
+        a.href = "#";
+        a.textContent = name.replace(currentFolder, "");
+        a.onclick = () => downloadBlob(name);
+
+        const meta = document.createElement("span");
+        meta.className = "file-meta";
+        meta.textContent = `(modificado: ${new Date(lastModified).toLocaleString()}, por ${currentUser})`;
+
+        li.appendChild(chk);
+        li.appendChild(a);
+        li.appendChild(meta);
+        listEl.appendChild(li);
+      }
+    }
+
+    async function appendToLog(action, fileName) {
+      const logName = "activity.log";
+      const logUrl = `https://${config.storageAccount}.blob.core.windows.net/${config.containerName}/${logName}`;
+      const timestamp = new Date().toISOString();
+      const entry = `[${timestamp}] ${currentUser} ${action} ${fileName}\n`;
+
+      let existing = "";
+      const headRes = await fetch(logUrl, {
+        method: "HEAD",
+        headers: {
+          Authorization: `Bearer ${currentToken}`,
+          "x-ms-version": "2023-01-03"
+        }
+      });
+
+      if (headRes.ok) {
+        const getRes = await fetch(logUrl, {
+          headers: {
+            Authorization: `Bearer ${currentToken}`,
+            "x-ms-version": "2023-01-03"
+          }
+        });
+        existing = await getRes.text();
+      }
+
+      const newLog = existing + entry;
+      await fetch(logUrl, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${currentToken}`,
+          "x-ms-version": "2023-01-03",
+          "x-ms-blob-type": "BlockBlob",
+          "Content-Type": "text/plain"
+        },
+        body: newLog
+      });
+    }
+
+    async function uploadFiles() {
+      if (currentFolder === "" || currentFolder === "root/") {
+        alert("No se pueden subir archivos en la carpeta raíz. Crea o selecciona una subcarpeta.");
+        return;
+      }
+      const input = document.getElementById("fileInput");
+      const status = document.getElementById("status");
+      for (const file of input.files) {
+        const blobName = currentFolder + file.name;
+        const url = `https://${config.storageAccount}.blob.core.windows.net/${config.containerName}/${encodeURIComponent(blobName)}`;
+
+        const checkRes = await fetch(url, {
+          method: "HEAD",
+          headers: {
+            Authorization: `Bearer ${currentToken}`,
+            "x-ms-version": "2023-01-03"
+          }
+        });
+
+        if (checkRes.ok) {
+          const overwrite = confirm(`El archivo ${file.name} ya existe. ¿Deseas sobrescribirlo?`);
+          if (!overwrite) continue;
+        }
+
+        const res = await fetch(url, {
+          method: "PUT",
+          headers: {
+            Authorization: `Bearer ${currentToken}`,
+            "x-ms-version": "2023-01-03",
+            "x-ms-blob-type": "BlockBlob",
+            "Content-Type": file.type
+          },
+          body: file
+        });
+
+        if (!res.ok) {
+          status.textContent = `Error al subir ${file.name}`;
+          return;
+        }
+
+        await appendToLog("subió", blobName);
+      }
+      status.textContent = "Subida completada.";
+      await listFiles(currentFolder);
+    }
+
+    async function deleteSelectedFiles(token) {
+      const checkboxes = document.querySelectorAll("#contentList input[type='checkbox']:checked");
+      if (checkboxes.length === 0) {
+        alert("Selecciona al menos un archivo para eliminar.");
+        return;
+      }
+
+      const status = document.getElementById("status");
+      status.textContent = "Eliminando...";
+
+      for (const checkbox of checkboxes) {
+        const blobName = checkbox.value;
+        const url = `https://${config.storageAccount}.blob.core.windows.net/${config.containerName}/${encodeURIComponent(blobName)}`;
+        const res = await fetch(url, {
+          method: "DELETE",
+          headers: {
+            Authorization: `Bearer ${token}`,
+            "x-ms-version": "2023-01-03"
+          }
+        });
+        if (!res.ok) {
+          status.textContent = `Error al eliminar ${checkbox.value}: ${res.statusText}`;
+          return;
+        }
+        await appendToLog("eliminó", blobName);
+      }
+
+      status.textContent = "Eliminación completada.";
+      await listFiles(currentFolder);
+    }
+
+    async function createFolder() {
+      const folderName = document.getElementById("newFolderInput").value.trim();
+      if (!folderName) return;
+      const fullPath = currentFolder + (folderName.endsWith("/") ? folderName : folderName + "/");
+      const url = `https://${config.storageAccount}.blob.core.windows.net/${config.containerName}/${encodeURIComponent(fullPath + ".dummy")}`;
+      await fetch(url, {
+        method: "PUT",
+        headers: {
+          Authorization: `Bearer ${currentToken}`,
+          "x-ms-version": "2023-01-03",
+          "x-ms-blob-type": "BlockBlob",
+          "Content-Type": "text/plain"
+        },
+        body: ""
+      });
+      await listFiles(currentFolder);
+    }
+
+    async function downloadBlob(blobName) {
+      const url = `https://${config.storageAccount}.blob.core.windows.net/${config.containerName}/${encodeURIComponent(blobName)}`;
+      const res = await fetch(url, {
+        headers: {
+          Authorization: `Bearer ${currentToken}`,
+          "x-ms-version": "2023-01-03"
+        }
+      });
+
+      if (!res.ok) {
+        alert("Error al descargar el archivo: " + blobName);
+        return;
+      }
+
+      const blob = await res.blob();
+      const downloadUrl = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = downloadUrl;
+      a.download = blobName.split("/").pop();
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(downloadUrl);
+    }
+
+    window.onload = async () => {
+      try {
+        await login();
+        await listFiles("root/");
+      } catch (e) {
+        document.getElementById("status").textContent = "Error de autenticación.";
+        console.error(e);
+      }
+    };
+  </script>
+</body>
+</html>
